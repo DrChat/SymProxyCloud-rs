@@ -69,7 +69,7 @@ jobs:
 
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
-          bin: pdblister
+          bin: symproxycloud-rs
           target: ${{ matrix.target }}
           tar: all
           zip: windows
