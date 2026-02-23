@@ -528,7 +528,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/:name1/:hash/:name2", get(symbol))
         .route("/health", get(health))
         .layer(TraceLayer::new_for_http())
-        .with_state(AppState { config, token, client });
+        .with_state(AppState {
+            config,
+            token,
+            client,
+        });
 
     tracing::info!("listening on {addr}");
 
