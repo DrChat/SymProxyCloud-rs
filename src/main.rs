@@ -186,6 +186,7 @@ async fn symbol(
         }
     }
 
+    let mut last_send_error = None;
     for server in &config.servers {
         let url = server
             .url
@@ -213,7 +214,8 @@ async fn symbol(
         let req = match req_builder.send().await {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!("request to {} failed after retries: {}", url, e);
+                tracing::warn!("request to {} failed after retries: {:#}", url, e);
+                last_send_error = Some(e);
                 continue;
             }
         };
@@ -375,6 +377,14 @@ async fn symbol(
             .context("failed to build response body")?);
     }
 
+    // If any upstream server failed with a transport/connection error, return 502 Bad Gateway
+    if let Some(e) = last_send_error {
+        return Ok(Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .body(Body::from(format!("502 Bad Gateway: all upstream servers failed: {:#}", e)))
+            .context("failed to build response body")?);
+    }
+
     Ok(Response::builder()
         .status(StatusCode::NOT_FOUND)
         .body(Body::empty())
@@ -518,7 +528,8 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to bind address")?;
 
     // Build the HTTP client with retry middleware for transient failures.
-    let retry_policy = ExponentialBackoff::builder().build_with_max_retries(args.max_retries);
+    let retry_policy =
+        ExponentialBackoff::builder().build_with_max_retries(args.max_retries);
     let client = reqwest_middleware::ClientBuilder::new(reqwest::Client::new())
         .with(RetryTransientMiddleware::new_with_policy(retry_policy))
         .build();
