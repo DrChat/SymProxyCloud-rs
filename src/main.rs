@@ -380,14 +380,15 @@ async fn symbol(
             .context("failed to build response body")?);
     }
 
-    // If any upstream server failed with a transport/connection error, return 502 Bad Gateway
-    if let Some(e) = last_send_error {
+    // If any upstream server failed with a transport/connection error, return 404.
+    // N.B: We intentionally do not include the error details in the response body
+    // to avoid leaking sensitive information.
+    if let Some(_e) = last_send_error {
         return Ok(Response::builder()
-            .status(StatusCode::BAD_GATEWAY)
-            .body(Body::from(format!(
-                "502 Bad Gateway: all upstream servers failed: {:#}",
-                e
-            )))
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::from(
+                "failed to reach one or more upstream servers",
+            ))
             .context("failed to build response body")?);
     }
 
