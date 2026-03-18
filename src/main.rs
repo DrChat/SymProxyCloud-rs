@@ -98,12 +98,19 @@ struct ConfigServer {
     auth: Option<ConfigAuth>,
 }
 
+fn default_max_retries() -> u32 {
+    4
+}
+
 #[derive(Deserialize, Debug, Clone)]
 struct AppConfig {
     listen_address: Option<SocketAddr>,
     i_am_not_an_idiot: bool,
     cache: Option<ConfigCache>,
     servers: Vec<ConfigServer>,
+    /// Maximum number of retries for transient request failures
+    #[serde(default = "default_max_retries")]
+    max_retries: u32,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -114,10 +121,6 @@ struct Args {
     /// Path to the configuration file
     #[arg(short, long, default_value = "default.toml")]
     config: PathBuf,
-
-    /// Maximum number of retries for transient request failures
-    #[arg(long, default_value = "4")]
-    max_retries: u32,
 }
 
 #[derive(Clone, FromRef)]
@@ -531,7 +534,7 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to bind address")?;
 
     // Build the HTTP client with retry middleware for transient failures.
-    let retry_policy = ExponentialBackoff::builder().build_with_max_retries(args.max_retries);
+    let retry_policy = ExponentialBackoff::builder().build_with_max_retries(config.max_retries);
     let client = reqwest_middleware::ClientBuilder::new(reqwest::Client::new())
         .with(RetryTransientMiddleware::new_with_policy(retry_policy))
         .build();
