@@ -386,9 +386,7 @@ async fn symbol(
     if let Some(_e) = last_send_error {
         return Ok(Response::builder()
             .status(StatusCode::NOT_FOUND)
-            .body(Body::from(
-                "failed to reach one or more upstream servers",
-            ))
+            .body(Body::from("failed to reach one or more upstream servers"))
             .context("failed to build response body")?);
     }
 
