@@ -11,6 +11,9 @@ listen_address = "127.0.0.1:5000"
 # authenticate incoming requests.
 i_am_not_an_idiot = false
 
+# Maximum number of retries for transient upstream request failures (default: 4)
+#max_retries = 4
+
 # Optional settings to configure symbol caching.
 #[cache]
 

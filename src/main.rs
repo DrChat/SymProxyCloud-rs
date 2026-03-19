@@ -16,6 +16,8 @@ use clap_verbosity_flag::{InfoLevel, LevelFilter, Verbosity};
 use figment::{providers::Format, Figment};
 use futures::{Stream, StreamExt, TryStreamExt};
 use reqwest::{header, StatusCode};
+use reqwest_middleware::ClientWithMiddleware;
+use reqwest_retry::{policies::ExponentialBackoff, RetryTransientMiddleware};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -96,12 +98,19 @@ struct ConfigServer {
     auth: Option<ConfigAuth>,
 }
 
+fn default_max_retries() -> u32 {
+    4
+}
+
 #[derive(Deserialize, Debug, Clone)]
 struct AppConfig {
     listen_address: Option<SocketAddr>,
     i_am_not_an_idiot: bool,
     cache: Option<ConfigCache>,
     servers: Vec<ConfigServer>,
+    /// Maximum number of retries for transient request failures
+    #[serde(default = "default_max_retries")]
+    max_retries: u32,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -118,12 +127,14 @@ struct Args {
 struct AppState {
     config: AppConfig,
     token: Arc<dyn TokenCredential>,
+    client: ClientWithMiddleware,
 }
 
 /// Primary endpoint used to proxy a symbol file from the configured upstream server.
 async fn symbol(
     State(token): State<Arc<dyn TokenCredential>>,
     State(config): State<AppConfig>,
+    State(client): State<ClientWithMiddleware>,
     Path((name1, hash, name2)): Path<(String, String, String)>,
 ) -> Result<Response, Error> {
     // Attempt the storage account first, if one is set.
@@ -178,6 +189,7 @@ async fn symbol(
         }
     }
 
+    let mut last_send_error = None;
     for server in &config.servers {
         let url = server
             .url
@@ -186,7 +198,7 @@ async fn symbol(
 
         // Dispatch a reqwest request to upstream, and serve the response.
         // https://github.com/tokio-rs/axum/blob/680cdcba7cfa0b4fb37aba0c129ab6e4379bae3b/examples/reqwest-response/src/main.rs#L53-L68
-        let req_builder = reqwest::Client::new().get(url.clone());
+        let req_builder = client.get(url.clone());
 
         // If there is a scope attached to this server, attempt to authenticate.
         let req_builder = if let Some(auth) = &server.auth {
@@ -202,7 +214,14 @@ async fn symbol(
             req_builder
         };
 
-        let req = req_builder.send().await.context("failed to send request")?;
+        let req = match req_builder.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("request to {} failed after retries: {:#}", url, e);
+                last_send_error = Some(e);
+                continue;
+            }
+        };
 
         // Check to see if the server returned a successful status code. If it didn't, continue on to the next server.
         trace!("{}: {}", url, req.status());
@@ -361,9 +380,15 @@ async fn symbol(
             .context("failed to build response body")?);
     }
 
+    // N.B: We intentionally do not include the error details in the response body
+    // to avoid leaking sensitive information.
     Ok(Response::builder()
         .status(StatusCode::NOT_FOUND)
-        .body(Body::empty())
+        .body(if last_send_error.is_some() {
+            Body::from("failed to reach one or more upstream servers")
+        } else {
+            Body::empty()
+        })
         .context("failed to build response body")?)
 }
 
@@ -503,12 +528,22 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("failed to bind address")?;
 
+    // Build the HTTP client with retry middleware for transient failures.
+    let retry_policy = ExponentialBackoff::builder().build_with_max_retries(config.max_retries);
+    let client = reqwest_middleware::ClientBuilder::new(reqwest::Client::new())
+        .with(RetryTransientMiddleware::new_with_policy(retry_policy))
+        .build();
+
     // Set up the `axum` application with a single endpoint to handle symbol server requests.
     let app = Router::new()
         .route("/:name1/:hash/:name2", get(symbol))
         .route("/health", get(health))
         .layer(TraceLayer::new_for_http())
-        .with_state(AppState { config, token });
+        .with_state(AppState {
+            config,
+            token,
+            client,
+        });
 
     tracing::info!("listening on {addr}");
 
