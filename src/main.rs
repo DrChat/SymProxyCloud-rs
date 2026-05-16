@@ -45,6 +45,11 @@ use tracing::{error, info, trace};
 use url::Url;
 use uuid::Uuid;
 
+mod http_range_reader;
+mod pdb_filter;
+use http_range_reader::HttpRangeReader;
+use pdb_filter::PdbFilter;
+
 /// The header used to indicate the upstream source where a symbol came from.
 const UPSTREAM_SOURCE: &str = "X-Upstream-Source";
 
@@ -193,6 +198,9 @@ struct AppConfig {
     /// Maximum number of retries for transient request failures
     #[serde(default = "default_max_retries")]
     max_retries: u32,
+    /// PDB validation filter mode (default: any)
+    #[serde(default)]
+    pdb_filter: PdbFilter,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -307,6 +315,50 @@ async fn symbol(
         trace!("{}: {}", url, req.status());
         if !req.status().is_success() {
             continue;
+        }
+
+        // If a PDB filter is enabled, validate via HTTP range requests without
+        // buffering the entire file. We do not rely on the file's name/extension:
+        // `validate_pdb_from_reader` attempts to open the file, which reads the
+        // header and determines whether it is a valid PDB. If it is not a PDB, or
+        // it fails the filter, we skip to the next server. Otherwise we fall
+        // through to the streaming path below.
+        let needs_pdb_validation = config.pdb_filter != PdbFilter::Any;
+
+        if needs_pdb_validation {
+            let url_str = url.to_string();
+            let bearer_token = if let Some(auth) = &server.auth {
+                Some(
+                    token
+                        .get_token(&[&auth.scope], None)
+                        .await
+                        .context("failed to get token for PDB validation")?
+                        .token
+                        .secret()
+                        .to_string(),
+                )
+            } else {
+                None
+            };
+            let filter = config.pdb_filter;
+
+            let valid = tokio::task::spawn_blocking(move || {
+                let reader = match bearer_token {
+                    Some(t) => HttpRangeReader::with_bearer_token(url_str, t),
+                    None => HttpRangeReader::new(url_str),
+                };
+                pdb_filter::validate_pdb_from_reader(reader, filter)
+            })
+            .await
+            .context("PDB validation task panicked")??;
+
+            if !valid {
+                info!(
+                    "upstream PDB from {} failed validation (filter={}), trying next server",
+                    url, config.pdb_filter
+                );
+                continue;
+            }
         }
 
         // Forward out the full response from the upstream server, including headers and status code.
@@ -576,6 +628,10 @@ async fn main() -> anyhow::Result<()> {
         .merge(figment::providers::Env::prefixed("SYMPROXY_"))
         .extract()
         .context("failed to load configuration")?;
+
+    if config.pdb_filter != PdbFilter::Any {
+        info!("PDB filter mode: {}", config.pdb_filter);
+    }
 
     // Validation.
     if config.servers.is_empty() {

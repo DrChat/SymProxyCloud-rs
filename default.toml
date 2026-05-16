@@ -11,6 +11,16 @@ listen_address = "127.0.0.1:5000"
 # authenticate incoming requests.
 i_am_not_an_idiot = false
 
+# PDB validation filter mode (default: any).
+# Controls whether downloaded/cached PDBs are validated for symbol content.
+# Unlike symchk, this also validates cached PDBs and re-downloads if they fail.
+# Valid values:
+#   any        - Verify PDB exists and is valid (symchk /pf default)
+#   private    - Require private symbols and line data (for code coverage)
+#   stripped   - Verify PDB is stripped of source line, data type, and global info (symchk /ps)
+#   has_types  - Verify PDB contains data type information (symchk /pt)
+#pdb_filter = "any"
+
 # Maximum number of retries for transient upstream request failures (default: 4)
 #max_retries = 4
 
