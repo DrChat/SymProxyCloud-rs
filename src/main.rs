@@ -7,25 +7,34 @@ use axum::{
     routing::get,
     Router,
 };
-use azure_core::{auth::TokenCredential, prelude::Metadata};
-use azure_storage::StorageCredentials;
-use azure_storage_blobs::blob::{BlobBlockType, BlockList};
+use azure_core::{
+    credentials::{AccessToken, TokenCredential, TokenRequestOptions},
+    http::{RequestContent, XmlFormat},
+};
+use azure_storage_blob::{
+    models::{BlockBlobClientCommitBlockListOptions, BlockLookupList},
+    BlobClient, BlobServiceClient,
+};
 use base64::Engine;
 use clap::Parser;
 use clap_verbosity_flag::{InfoLevel, LevelFilter, Verbosity};
 use figment::{providers::Format, Figment};
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt};
 use reqwest::{header, StatusCode};
 use reqwest_middleware::ClientWithMiddleware;
 use reqwest_retry::{policies::ExponentialBackoff, RetryTransientMiddleware};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
     net::{Ipv4Addr, SocketAddr},
     path::PathBuf,
     pin::Pin,
     str::FromStr,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
 };
 use thiserror::Error;
 use tokio::{io::AsyncWriteExt, net::TcpListener};
@@ -61,6 +70,81 @@ impl IntoResponse for Error {
     }
 }
 
+/// A token credential that authenticates using a managed identity when running in
+/// Azure, falling back to local developer tooling (e.g. the Azure CLI) otherwise.
+///
+/// This mirrors the behaviour of the default credential chain that previously shipped
+/// with the Azure SDK, which was removed in the 1.0 release.
+#[derive(Debug)]
+struct DefaultCredential {
+    sources: Vec<Arc<dyn TokenCredential>>,
+    /// Index of the source that first provided a token. `usize::MAX` indicates that no
+    /// source has provided a token yet.
+    cached_source: AtomicUsize,
+}
+
+impl DefaultCredential {
+    fn new() -> anyhow::Result<Self> {
+        let sources: Vec<Arc<dyn TokenCredential>> = vec![
+            azure_identity::DeveloperToolsCredential::new(None)
+                .context("failed to create developer tools credential")?,
+            azure_identity::ManagedIdentityCredential::new(None)
+                .context("failed to create managed identity credential")?,
+        ];
+
+        Ok(Self {
+            sources,
+            cached_source: AtomicUsize::new(usize::MAX),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl TokenCredential for DefaultCredential {
+    async fn get_token(
+        &self,
+        scopes: &[&str],
+        options: Option<TokenRequestOptions<'_>>,
+    ) -> azure_core::Result<AccessToken> {
+        let cached = self.cached_source.load(Ordering::Relaxed);
+        if let Some(source) = self.sources.get(cached) {
+            return source.get_token(scopes, options).await;
+        }
+
+        let mut last_error = None;
+        for (index, source) in self.sources.iter().enumerate() {
+            match source.get_token(scopes, options.clone()).await {
+                Ok(token) => {
+                    self.cached_source.store(index, Ordering::Relaxed);
+                    return Ok(token);
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            azure_core::Error::with_message(
+                azure_core::error::ErrorKind::Credential,
+                "no token credential sources are available",
+            )
+        }))
+    }
+}
+
+fn azure_blob_client(
+    account: &str,
+    container: &str,
+    token: Arc<dyn TokenCredential>,
+    blob_name: &str,
+) -> anyhow::Result<BlobClient> {
+    let service_url = Url::parse(&format!("https://{}.blob.core.windows.net/", account))
+        .context("failed to build storage account url")?;
+
+    Ok(BlobServiceClient::new(service_url, Some(token), None)
+        .context("failed to create blob service client")?
+        .blob_client(container, blob_name))
+}
+
 #[derive(Deserialize, Debug, Clone)]
 struct ConfigAuth {
     /// The scope of the authentication token
@@ -73,8 +157,6 @@ struct ConfigAzureCache {
     storage_account: String,
     /// The container within the storage account to use
     storage_container: String,
-    /// Access key
-    key: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -141,33 +223,31 @@ async fn symbol(
     if let Some(cache) = &config.cache {
         match &cache {
             ConfigCache::Azure(cache) => {
-                let cred = if let Some(key) = &cache.key {
-                    StorageCredentials::access_key(&cache.storage_account, key.clone())
-                } else {
-                    StorageCredentials::token_credential(token.clone())
-                };
+                let client = azure_blob_client(
+                    &cache.storage_account,
+                    &cache.storage_container,
+                    token.clone(),
+                    &format!("{name1}/{hash}/{name2}"),
+                )?;
 
-                let client =
-                    azure_storage_blobs::prelude::ClientBuilder::new(&cache.storage_account, cred)
-                        .blob_client(&cache.storage_container, format!("{name1}/{hash}/{name2}"));
-
-                if let Ok(props) = client.get_properties().await {
+                if let Ok(result) = client.download(None).await {
                     // N.B: Get the blob's data and stream it out directly instead of generating a SAS URL and returning a 302.
                     //
                     // This is important because this application may be placed behind a reverse proxy that supports auth,
                     // and returning an SAS URL subverts the authority of the reverse proxy (e.g. reverse proxy may want
                     // to log requests or set a time limit, but an SAS URL will allow users to bypass that).
-                    let body = client.get().into_stream().map_ok(|r| r.data).try_flatten();
+                    let r = Response::builder();
+                    let r = if let Some(content_length) = &result.properties.content_length {
+                        r.header(header::CONTENT_LENGTH, content_length.to_string())
+                    } else {
+                        r
+                    };
 
-                    return Ok(Response::builder()
+                    return Ok(r
                         .header(UPSTREAM_SOURCE, "cache")
                         .header(header::CONTENT_TYPE, "application/octet-stream")
-                        .header(
-                            header::CONTENT_LENGTH,
-                            &props.blob.properties.content_length.to_string(),
-                        )
                         .status(StatusCode::OK)
-                        .body(Body::from_stream(body))
+                        .body(Body::from_stream(result.body))
                         .context("failed to build response body")?);
                 }
             }
@@ -204,7 +284,7 @@ async fn symbol(
         let req_builder = if let Some(auth) = &server.auth {
             req_builder.bearer_auth(
                 token
-                    .get_token(&[&auth.scope])
+                    .get_token(&[auth.scope.as_str()], None)
                     .await
                     .context("failed to get token")?
                     .token
@@ -259,36 +339,42 @@ async fn symbol(
             tokio::spawn(async move {
                 match cache {
                     ConfigCache::Azure(cache) => {
-                        let cred = if let Some(key) = &cache.key {
-                            StorageCredentials::access_key(&cache.storage_account, key.clone())
-                        } else {
-                            StorageCredentials::token_credential(token.clone())
-                        };
-
                         // Wrap the client in an `Option`. If an error occurs, the client will be set to `None` and
                         // mirroring will be aborted.
-                        let mut client = Some(
-                            azure_storage_blobs::prelude::ClientBuilder::new(
-                                &cache.storage_account,
-                                cred,
-                            )
-                            .blob_client(
-                                &cache.storage_container,
-                                format!("{name1}/{hash}/{name2}"),
-                            ),
-                        );
+                        let mut client = match azure_blob_client(
+                            &cache.storage_account,
+                            &cache.storage_container,
+                            token.clone(),
+                            &format!("{name1}/{hash}/{name2}"),
+                        ) {
+                            Ok(client) => Some(client.block_blob_client()),
+                            Err(e) => {
+                                error!(
+                                    "{:?}",
+                                    e.context(
+                                        "failed to create blob client while mirroring symbol"
+                                    )
+                                );
+                                None
+                            }
+                        };
 
-                        let mut block_list = BlockList::default();
+                        let mut block_ids: Vec<Vec<u8>> = Vec::new();
                         while let Some(chunk) = stream.next().await {
                             let chunk = chunk.context("failed to read chunk")?;
 
                             // N.B: `block_id` must be <= 64 bytes in size.
                             // Use a randomly generated ID to avoid conflicts.
-                            let block_id = format!("{}", Uuid::new_v4());
+                            let block_id = Uuid::new_v4();
 
                             if let Err(e) = match &client {
                                 Some(client) => client
-                                    .put_block(block_id.clone(), chunk.clone())
+                                    .stage_block(
+                                        block_id.as_bytes(),
+                                        chunk.len() as u64,
+                                        RequestContent::from(chunk.to_vec()),
+                                        None,
+                                    )
                                     .await
                                     .map(|_| ()),
                                 None => Ok(()),
@@ -296,16 +382,15 @@ async fn symbol(
                                 error!(
                                     "{:?}",
                                     anyhow::Error::new(e)
-                                        .context("failed to put block while mirroring symbol")
+                                        .context("failed to stage block while mirroring symbol")
                                 );
 
                                 // If an error occurs, set the client to `None` to abort mirroring.
                                 client = None;
                             }
 
-                            block_list
-                                .blocks
-                                .push(BlobBlockType::new_uncommitted(block_id));
+                            // N.B: This _MUST_ be the same layout as what was passed to `stage_block`!
+                            block_ids.push(block_id.as_bytes().to_vec());
 
                             // Forward the data on to the original requesting client.
                             // Ignore errors since we want mirroring to continue even if the client
@@ -319,18 +404,40 @@ async fn symbol(
                         // time, the last one wins. Unfortunately we cannot acquire a lease on a blob that has not
                         // been created so we cannot prevent this race.
                         if let Some(client) = client {
-                            let mut meta = Metadata::new();
-                            meta.insert(
-                                "UpstreamServer",
+                            let mut metadata = HashMap::new();
+                            metadata.insert(
+                                "UpstreamServer".to_string(),
                                 form_urlencoded::byte_serialize(url.as_str().as_bytes())
                                     .collect::<String>(),
                             );
 
-                            if let Err(e) = client.put_block_list(block_list).metadata(meta).await {
-                                error!(
-                                    "{:?}",
-                                    anyhow::Error::new(e).context("failed to mirror symbol")
-                                );
+                            let block_list = BlockLookupList {
+                                latest: Some(block_ids),
+                                ..Default::default()
+                            };
+
+                            let options = BlockBlobClientCommitBlockListOptions {
+                                metadata: Some(metadata),
+                                ..Default::default()
+                            };
+
+                            let f = async {
+                                let content = block_list
+                                    .try_into()
+                                    .context("failed to serialize block list")?;
+                                client
+                                    .commit_block_list(content, Some(options))
+                                    .await
+                                    .context("failed to mirror symbol")?;
+
+                                Ok::<_, anyhow::Error>(())
+                            };
+
+                            match f.await {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    error!("{:?}", e.context("failed to mirror symbol"));
+                                }
                             }
                         }
 
@@ -480,8 +587,8 @@ async fn main() -> anyhow::Result<()> {
     // N.B: We are _not_ going to add support for secret-based authentication.
     // It is insecure and strongly discouraged, so to encourage best practices
     // we should just not support it :)
-    let token =
-        azure_identity::create_default_credential().context("failed to create Azure credential")?;
+    let token: Arc<dyn TokenCredential> =
+        Arc::new(DefaultCredential::new().context("failed to create Azure credential")?);
 
     // Run through every configured server and ensure they are reachable.
     for server in &mut config.servers {
@@ -509,7 +616,7 @@ async fn main() -> anyhow::Result<()> {
         if let Some(auth) = &server.auth {
             info!("acquiring token for server: {}", server.url);
             let _tok = token
-                .get_token(&[&auth.scope])
+                .get_token(&[auth.scope.as_str()], None)
                 .await
                 .with_context(|| format!("failed to get token for {}", server.url))?;
         }
