@@ -1,6 +1,7 @@
 /*
 !/.github
 !/src
+!/tests/*.py
 !/.gitignore
 !/Cargo.lock
 !/Cargo.toml
