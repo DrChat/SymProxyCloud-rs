@@ -9,7 +9,7 @@ use axum::{
 };
 use azure_core::{
     credentials::{AccessToken, TokenCredential, TokenRequestOptions},
-    http::{RequestContent, XmlFormat},
+    http::RequestContent,
 };
 use azure_storage_blob::{
     models::{BlockBlobClientCommitBlockListOptions, BlockLookupList},
