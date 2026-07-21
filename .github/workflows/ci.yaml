@@ -64,6 +64,16 @@ jobs:
     - name: build
       run: cargo build --target ${{ matrix.host_target }} --release
 
+    - name: install Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
+
+    - name: integration tests
+      env:
+        SYMPROXYCLOUD_BIN: target/${{ matrix.host_target }}/release/${{ matrix.artifact }}
+      run: python tests/test_integration.py
+
     - name: upload artifacts
       uses: actions/upload-artifact@v4
       with:
