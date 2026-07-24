@@ -10,6 +10,7 @@ use axum::{
 use azure_core::{
     credentials::{AccessToken, TokenCredential, TokenRequestOptions},
     http::RequestContent,
+    time::{Duration, OffsetDateTime},
 };
 use azure_storage_blob::{
     models::{BlockBlobClientCommitBlockListOptions, BlockLookupList},
@@ -20,6 +21,7 @@ use clap::Parser;
 use clap_verbosity_flag::{InfoLevel, LevelFilter, Verbosity};
 use figment::{providers::Format, Figment};
 use futures::{Stream, StreamExt};
+use ms_pdb::Pdb;
 use reqwest::{header, StatusCode};
 use reqwest_middleware::ClientWithMiddleware;
 use reqwest_retry::{policies::ExponentialBackoff, RetryTransientMiddleware};
@@ -31,19 +33,24 @@ use std::{
     path::PathBuf,
     pin::Pin,
     str::FromStr,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
+    sync::Arc,
+    time::Instant,
 };
 use thiserror::Error;
-use tokio::{io::AsyncWriteExt, net::TcpListener};
+use tokio::{io::AsyncWriteExt, net::TcpListener, sync::Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::ReaderStream;
 use tower_http::trace::TraceLayer;
-use tracing::{error, info, trace};
+use tracing::{error, info, trace, warn};
 use url::Url;
 use uuid::Uuid;
+
+mod httpio;
+mod pdb_filter;
+use httpio::IoClientExt;
+use pdb_filter::PdbFilter;
+
+use crate::pdb_filter::pdb_flags;
 
 /// The header used to indicate the upstream source where a symbol came from.
 const UPSTREAM_SOURCE: &str = "X-Upstream-Source";
@@ -78,9 +85,7 @@ impl IntoResponse for Error {
 #[derive(Debug)]
 struct DefaultCredential {
     sources: Vec<Arc<dyn TokenCredential>>,
-    /// Index of the source that first provided a token. `usize::MAX` indicates that no
-    /// source has provided a token yet.
-    cached_source: AtomicUsize,
+    cached_token: Mutex<Option<AccessToken>>,
 }
 
 impl DefaultCredential {
@@ -94,7 +99,7 @@ impl DefaultCredential {
 
         Ok(Self {
             sources,
-            cached_source: AtomicUsize::new(usize::MAX),
+            cached_token: Mutex::new(None),
         })
     }
 }
@@ -106,16 +111,18 @@ impl TokenCredential for DefaultCredential {
         scopes: &[&str],
         options: Option<TokenRequestOptions<'_>>,
     ) -> azure_core::Result<AccessToken> {
-        let cached = self.cached_source.load(Ordering::Relaxed);
-        if let Some(source) = self.sources.get(cached) {
-            return source.get_token(scopes, options).await;
+        let mut cached = self.cached_token.lock().await;
+        if let Some(tok) = &*cached {
+            if OffsetDateTime::now_utc() < tok.expires_on.saturating_sub(Duration::minutes(1)) {
+                return Ok(tok.clone());
+            }
         }
 
         let mut last_error = None;
-        for (index, source) in self.sources.iter().enumerate() {
+        for source in self.sources.iter() {
             match source.get_token(scopes, options.clone()).await {
                 Ok(token) => {
-                    self.cached_source.store(index, Ordering::Relaxed);
+                    *cached = Some(token.clone());
                     return Ok(token);
                 }
                 Err(error) => last_error = Some(error),
@@ -193,6 +200,9 @@ struct AppConfig {
     /// Maximum number of retries for transient request failures
     #[serde(default = "default_max_retries")]
     max_retries: u32,
+    /// PDB validation filter mode (default: any)
+    #[serde(default)]
+    pdb_filter: PdbFilter,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -276,6 +286,9 @@ async fn symbol(
             .join(&format!("{name1}/{hash}/{name2}"))
             .context("failed to build request url")?;
 
+        // N.B: Normally we'd probably want to use a HEAD request here to determine what the server supports.
+        // But Azure doesn't support HEAD requests.
+
         // Dispatch a reqwest request to upstream, and serve the response.
         // https://github.com/tokio-rs/axum/blob/680cdcba7cfa0b4fb37aba0c129ab6e4379bae3b/examples/reqwest-response/src/main.rs#L53-L68
         let req_builder = client.get(url.clone());
@@ -293,6 +306,45 @@ async fn symbol(
         } else {
             req_builder
         };
+
+        // If a PDB filter is enabled, attempt to determine whether the PDB passes the filter.
+        if config.pdb_filter != PdbFilter::Any {
+            let t = Instant::now();
+
+            // Read the PDB from the upstream server using random I/O (via HTTP range requests)
+            let reader = req_builder
+                .try_clone()
+                .context("failed to clone request for PDB validation")?
+                .io();
+
+            let uri = url.clone();
+            let r = tokio::task::spawn_blocking(move || {
+                let pdb = Pdb::open_from_random_file(reader).context("failed to open PDB")?;
+                let flags = pdb_flags(&pdb).context("failed to determine PDB flags")?;
+
+                trace!("{}: {:?} ({}ms)", &uri, flags, t.elapsed().as_millis());
+                Ok::<_, Error>(pdb_filter::filter_matches(flags, config.pdb_filter))
+            })
+            .await
+            .context("PDB validation task panicked")?;
+
+            match r {
+                Ok(true) => (),
+                Err(e) => {
+                    warn!("failed to apply PDB filter to {url}: {e}");
+                    continue;
+                }
+                Ok(false) => {
+                    // TODO: Set a flag, and if all upstream sources are filtered then return it in the response.
+                    trace!(
+                        "upstream PDB from {} failed filter, trying next server ({}ms)",
+                        url,
+                        t.elapsed().as_millis(),
+                    );
+                    continue;
+                }
+            }
+        }
 
         let req = match req_builder.send().await {
             Ok(r) => r,

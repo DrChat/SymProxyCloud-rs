@@ -11,6 +11,21 @@ listen_address = "127.0.0.1:5000"
 # authenticate incoming requests.
 i_am_not_an_idiot = false
 
+# BETA: PDB filter. Rejects upstream PDBs that do not match certain criteria.
+#
+# This ONLY works if the upstream server supports RFC 7233 (range requests). If a filter
+# is set and this is not supported, PDBs will not be served from the upstream source.
+#
+# NOTE: This filter is _NOT_ retroactively applied to PDBs that have already been cached.
+# If you apply a more strict filter, you should clear your cache manually.
+#
+# Valid values:
+#   any        - Verify PDB exists and is valid (symchk /pf) - default
+#   private    - Require private symbols and line data (the most strict validation)
+#   stripped   - Verify PDB is stripped of source line, data type, and global info (symchk /ps)
+#   has_types  - Verify PDB contains data type information (symchk /pt)
+pdb_filter = "any"
+
 # Maximum number of retries for transient upstream request failures (default: 4)
 #max_retries = 4
 
