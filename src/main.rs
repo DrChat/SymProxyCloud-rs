@@ -83,12 +83,13 @@ impl IntoResponse for Error {
 /// This mirrors the behaviour of the default credential chain that previously shipped
 /// with the Azure SDK, which was removed in the 1.0 release.
 #[derive(Debug)]
-struct DefaultCredential {
+struct MultiCredential {
     sources: Vec<Arc<dyn TokenCredential>>,
     cached_token: Mutex<Option<AccessToken>>,
 }
 
-impl DefaultCredential {
+impl MultiCredential {
+    #[allow(unused)]
     fn new() -> anyhow::Result<Self> {
         let sources: Vec<Arc<dyn TokenCredential>> = vec![
             azure_identity::DeveloperToolsCredential::new(None)
@@ -102,10 +103,17 @@ impl DefaultCredential {
             cached_token: Mutex::new(None),
         })
     }
+
+    fn with_sources(sources: impl IntoIterator<Item = Arc<dyn TokenCredential>>) -> Self {
+        Self {
+            sources: sources.into_iter().collect(),
+            cached_token: Mutex::new(None),
+        }
+    }
 }
 
 #[async_trait::async_trait]
-impl TokenCredential for DefaultCredential {
+impl TokenCredential for MultiCredential {
     async fn get_token(
         &self,
         scopes: &[&str],
@@ -203,6 +211,8 @@ struct AppConfig {
     /// PDB validation filter mode (default: any)
     #[serde(default)]
     pdb_filter: PdbFilter,
+    /// The client ID to use when retrieving the managed identity token.
+    managed_identity_client_id: Option<Uuid>,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -639,8 +649,18 @@ async fn main() -> anyhow::Result<()> {
     // N.B: We are _not_ going to add support for secret-based authentication.
     // It is insecure and strongly discouraged, so to encourage best practices
     // we should just not support it :)
-    let token: Arc<dyn TokenCredential> =
-        Arc::new(DefaultCredential::new().context("failed to create Azure credential")?);
+    let token: Arc<dyn TokenCredential> = Arc::new(MultiCredential::with_sources([
+        // Developer tools authentication (Azure CLI) for local testing.
+        azure_identity::DeveloperToolsCredential::new(None)? as Arc<dyn TokenCredential>,
+        azure_identity::ManagedIdentityCredential::new(Some(
+            azure_identity::ManagedIdentityCredentialOptions {
+                user_assigned_id: config
+                    .managed_identity_client_id
+                    .map(|u| azure_identity::UserAssignedId::ClientId(u.to_string())),
+                client_options: azure_core::http::ClientOptions::default(),
+            },
+        ))? as Arc<dyn TokenCredential>,
+    ]));
 
     // Run through every configured server and ensure they are reachable.
     for server in &mut config.servers {
