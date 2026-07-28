@@ -18,7 +18,7 @@ Afterwards, use the server by adding it to your symbol path: `SRV*http://localho
 * High throughput and performance 🚀
 * Minimal memory and CPU footprint. On my system, <1% CPU and ~30MB RAM _even under full load_.
 * Proxying to _multiple_ upstream server sources.
-* Filtering PDBs (e.g. serve only private symbols, or public symbols, or etc.)
+* Symchk-esque PDB filtering (e.g. serve only private symbols, or public symbols, or etc.)
 * Symbol mirroring to either an Azure storage account or filesystem.
 * Layered configurability with TOML file and environment variable overrides (e.g. `SYMPROXY_LISTEN_ADDRESS`).
 * Health check endpoint at `/health` that can be used [directly by Azure](https://learn.microsoft.com/en-us/azure/app-service/monitor-instances-health-check?tabs=dotnet) to monitor the service's health.
