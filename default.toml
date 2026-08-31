@@ -26,6 +26,23 @@ i_am_not_an_idiot = false
 #   has_types  - Verify PDB contains data type information (symchk /pt)
 pdb_filter = "any"
 
+# Negotiate for the compressed PDB (PDZ / MSFZ) container format by sending
+# `Accept: application/msfz0` to upstream symbol servers
+#
+# When a response contains `x-ms-symbol-format: application/msfz0`, the file is treated as a PDZ and is cached under the
+# symsrv PDZ client key rather than the PDB key, so the two do not collide.
+#
+#   ntdll.pdb/<index>/ntdll.pdb         MSF
+#   ntdll.pdb/<index>/msfz0/ntdll.pdb   MSFZ
+#
+# An empty or absent `x-ms-symbol-format` means an ordinary PDB.
+#
+# Set this to false if your clients cannot consume PDZ files.
+#request_pdz = true
+
+# The `User-Agent` presented to upstream symbol servers.
+#user_agent = "Microsoft-Symbol-Server/10.0.0.0 SymProxyCloud/0.0.0"
+
 # Maximum number of retries for transient upstream request failures (default: 4)
 #max_retries = 4
 

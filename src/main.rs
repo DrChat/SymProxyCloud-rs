@@ -21,9 +21,9 @@ use clap::Parser;
 use clap_verbosity_flag::{InfoLevel, LevelFilter, Verbosity};
 use figment::{providers::Format, Figment};
 use futures::{Stream, StreamExt};
-use ms_pdb::Pdb;
+use ms_pdb::{Container, Pdb};
 use reqwest::{header, StatusCode};
-use reqwest_middleware::ClientWithMiddleware;
+use reqwest_middleware::{ClientWithMiddleware, RequestBuilder};
 use reqwest_retry::{policies::ExponentialBackoff, RetryTransientMiddleware};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -60,6 +60,78 @@ const UPSTREAM_SERVER: &str = "X-Upstream-Server";
 
 /// The internal authentication token provided to us from Azure.
 const INTERNAL_AUTH_TOKEN: &str = "x-ms-auth-internal-token";
+
+/// The media type used by symbol servers to describe the compressed PDB (PDZ/MSFZ) container.
+const MSFZ_CONTENT_TYPE: &str = "application/msfz0";
+
+/// The header symbol servers use to report which container format they actually served.
+///
+/// An empty value means an ordinary PDB; `application/msfz0` means a PDZ.
+const SYMBOL_FORMAT_HEADER: &str = "x-ms-symbol-format";
+
+/// The maximum number of redirects to follow when fetching a symbol from upstream.
+const MAX_REDIRECTS: usize = 10;
+
+/// The container format of a symbol file.
+///
+/// Symbol servers negotiate this via `Accept`/`x-ms-symbol-format`, and store each format under a
+/// distinct client key, so the two must never be conflated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SymbolFormat {
+    /// An uncompressed PDB (MSF) file.
+    Pdb,
+    /// A compressed PDB (PDZ/MSFZ) file.
+    Pdz,
+}
+
+impl SymbolFormat {
+    /// The value to report in `x-ms-symbol-format`, mirroring the upstream contract where an
+    /// empty value denotes an ordinary PDB.
+    fn symbol_format_header(self) -> &'static str {
+        match self {
+            Self::Pdb => "",
+            Self::Pdz => MSFZ_CONTENT_TYPE,
+        }
+    }
+
+    /// Builds the symbol store key for this format.
+    ///
+    /// Per the symsrv convention, a PDZ keeps the original file name but is nested one level
+    /// deeper under an `msfz0` directory, so the two representations never collide:
+    ///
+    /// ```text
+    /// ntdll.pdb/<index>/ntdll.pdb          MSF
+    /// ntdll.pdb/<index>/msfz0/ntdll.pdb    MSFZ
+    /// ```
+    fn client_key(self, name1: &str, hash: &str, name2: &str) -> String {
+        match self {
+            Self::Pdb => format!("{name1}/{hash}/{name2}"),
+            Self::Pdz => format!("{name1}/{hash}/msfz0/{name2}"),
+        }
+    }
+
+    /// Interprets a media type. Returns `None` when the value does not identify a format we
+    /// recognise, so the caller can fall back to its own default.
+    fn from_media_type(value: &HeaderValue) -> Option<Self> {
+        let media_type = value.to_str().ok()?.split(';').next()?.trim();
+        media_type
+            .eq_ignore_ascii_case(MSFZ_CONTENT_TYPE)
+            .then_some(Self::Pdz)
+    }
+
+    /// Determines the container format from the `x-ms-symbol-format` header, if present.
+    /// The Internal Symbol Server reports this format in the 302 redirect.
+    fn from_headers(headers: &reqwest::header::HeaderMap) -> Option<Self> {
+        headers
+            .get(SYMBOL_FORMAT_HEADER)
+            .and_then(Self::from_media_type)
+    }
+}
+
+/// Rejects request path segments that could escape the cache directory or the upstream URL path.
+fn valid_segment(segment: &str) -> bool {
+    !segment.is_empty() && segment != "." && segment != ".." && !segment.contains(['/', '\\', '\0'])
+}
 
 /// `axum`-compatible error handler.
 #[derive(Debug, Error)]
@@ -199,6 +271,17 @@ fn default_max_retries() -> u32 {
     4
 }
 
+fn default_request_pdz() -> bool {
+    true
+}
+
+fn default_user_agent() -> String {
+    format!(
+        "Microsoft-Symbol-Server/10.0.0.0 SymProxyCloud/{}",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
 #[derive(Deserialize, Debug, Clone)]
 struct AppConfig {
     listen_address: Option<SocketAddr>,
@@ -211,8 +294,25 @@ struct AppConfig {
     /// PDB validation filter mode (default: any)
     #[serde(default)]
     pdb_filter: PdbFilter,
+    /// Whether to negotiate for the compressed PDZ (MSFZ) container format.
+    #[serde(default = "default_request_pdz")]
+    request_pdz: bool,
+    /// The `User-Agent` presented to upstream symbol servers.
+    #[serde(default = "default_user_agent")]
+    user_agent: String,
     /// The client ID to use when retrieving the managed identity token.
     managed_identity_client_id: Option<Uuid>,
+}
+
+impl AppConfig {
+    /// The container formats to probe in the cache, in priority order.
+    fn cache_formats(&self) -> &'static [SymbolFormat] {
+        if self.request_pdz {
+            &[SymbolFormat::Pdz, SymbolFormat::Pdb]
+        } else {
+            &[SymbolFormat::Pdb]
+        }
+    }
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -232,6 +332,171 @@ struct AppState {
     client: ClientWithMiddleware,
 }
 
+/// Builds a request to an upstream symbol server, applying content negotiation, identification
+/// and (optionally) authentication.
+fn build_upstream_request(
+    client: &ClientWithMiddleware,
+    url: &Url,
+    bearer: Option<&str>,
+    config: &AppConfig,
+) -> RequestBuilder {
+    let mut builder = client
+        .get(url.clone())
+        .header(header::USER_AGENT, config.user_agent.as_str());
+
+    if config.request_pdz {
+        builder = builder.header(header::ACCEPT, MSFZ_CONTENT_TYPE);
+    }
+
+    match bearer {
+        Some(token) => builder.bearer_auth(token),
+        None => builder,
+    }
+}
+
+/// An upstream symbol request that has been followed to its final destination.
+struct Resolved {
+    response: reqwest::Response,
+    /// The URL that ultimately served the response.
+    url: Url,
+    /// The container format the server advertised, if it advertised one.
+    format: Option<SymbolFormat>,
+    /// Whether the bearer token survived the redirect chain.
+    authenticated: bool,
+}
+
+/// Fetches a symbol from upstream, following redirects manually.
+///
+/// Redirects are followed by hand rather than by `reqwest` because symbol servers report the
+/// container format on the `302` response itself (`x-ms-symbol-format: application/msfz0` for a
+/// PDZ). The redirect target is blob storage, which knows nothing about the negotiation, so that
+/// header is lost once the redirect has been transparently followed.
+async fn resolve(
+    client: &ClientWithMiddleware,
+    url: Url,
+    bearer: Option<&str>,
+    config: &AppConfig,
+) -> anyhow::Result<Resolved> {
+    let origin = url.origin();
+    let mut url = url;
+    let mut authenticated = bearer.is_some();
+    let mut format = None;
+
+    for _ in 0..=MAX_REDIRECTS {
+        let credential = authenticated.then_some(bearer).flatten();
+        let response = build_upstream_request(client, &url, credential, config)
+            .send()
+            .await
+            .with_context(|| format!("request to {url} failed"))?;
+
+        if !response.status().is_redirection() {
+            return Ok(Resolved {
+                response,
+                url,
+                format,
+                authenticated,
+            });
+        }
+
+        if let Some(detected) = SymbolFormat::from_headers(response.headers()) {
+            format = Some(detected);
+        }
+
+        // Copy the location out so the borrow on `response` ends before it is moved or replaced.
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .map(|value| value.to_str().map(str::to_owned));
+
+        let location = match location {
+            Some(Ok(location)) => location,
+            Some(Err(_)) => anyhow::bail!("redirect from {url} has a malformed Location header"),
+            // A redirect without a location is not actionable; let the caller deal with it.
+            None => {
+                return Ok(Resolved {
+                    response,
+                    url,
+                    format,
+                    authenticated,
+                })
+            }
+        };
+
+        let next = url
+            .join(&location)
+            .with_context(|| format!("failed to resolve redirect from {url}"))?;
+
+        // Never carry the bearer token across an origin boundary.
+        authenticated = bearer.is_some() && next.origin() == origin;
+        url = next;
+    }
+
+    anyhow::bail!("exceeded {MAX_REDIRECTS} redirects while fetching {url}")
+}
+
+/// Attempts to serve a symbol out of the cache. Returns `Ok(None)` on a cache miss.
+async fn cache_lookup(
+    cache: &ConfigCache,
+    token: &Arc<dyn TokenCredential>,
+    key: &str,
+    format: SymbolFormat,
+) -> anyhow::Result<Option<Response>> {
+    match cache {
+        ConfigCache::Azure(cache) => {
+            let client = azure_blob_client(
+                &cache.storage_account,
+                &cache.storage_container,
+                token.clone(),
+                key,
+            )?;
+
+            let Ok(result) = client.download(None).await else {
+                return Ok(None);
+            };
+
+            // N.B: Get the blob's data and stream it out directly instead of generating a SAS URL and returning a 302.
+            //
+            // This is important because this application may be placed behind a reverse proxy that supports auth,
+            // and returning an SAS URL subverts the authority of the reverse proxy (e.g. reverse proxy may want
+            // to log requests or set a time limit, but an SAS URL will allow users to bypass that).
+            let r = Response::builder();
+            let r = if let Some(content_length) = &result.properties.content_length {
+                r.header(header::CONTENT_LENGTH, content_length.to_string())
+            } else {
+                r
+            };
+
+            Ok(Some(
+                r.header(UPSTREAM_SOURCE, "cache")
+                    .header(SYMBOL_FORMAT_HEADER, format.symbol_format_header())
+                    .header(header::CONTENT_TYPE, "application/octet-stream")
+                    .status(StatusCode::OK)
+                    .body(Body::from_stream(result.body))
+                    .context("failed to build response body")?,
+            ))
+        }
+        ConfigCache::Fs(cache) => {
+            let Ok(f) = tokio::fs::File::open(cache.path.join(key)).await else {
+                return Ok(None);
+            };
+
+            let meta = f.metadata().await.context("failed to get file metadata")?;
+            let body = ReaderStream::new(f);
+
+            Ok(Some(
+                Response::builder()
+                    .header(UPSTREAM_SOURCE, "cache")
+                    .header(SYMBOL_FORMAT_HEADER, format.symbol_format_header())
+                    .header(header::CONTENT_TYPE, "application/octet-stream")
+                    .header(header::CONTENT_LENGTH, meta.len().to_string())
+                    .status(StatusCode::OK)
+                    .body(Body::from_stream(body))
+                    .context("failed to build response body")?,
+            ))
+        }
+    }
+}
+
 /// Primary endpoint used to proxy a symbol file from the configured upstream server.
 async fn symbol(
     State(token): State<Arc<dyn TokenCredential>>,
@@ -239,57 +504,29 @@ async fn symbol(
     State(client): State<ClientWithMiddleware>,
     Path((name1, hash, name2)): Path<(String, String, String)>,
 ) -> Result<Response, Error> {
-    // Attempt the storage account first, if one is set.
+    // Reject any segment that could escape the cache directory or the upstream URL path.
+    if ![name1.as_str(), hash.as_str(), name2.as_str()]
+        .into_iter()
+        .all(valid_segment)
+    {
+        return Ok(Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Body::empty())
+            .context("failed to build response body")?);
+    }
+
+    // Attempt the cache first, if one is set. PDZ and PDB are stored under separate client keys,
+    // so each candidate format has to be probed in turn.
     if let Some(cache) = &config.cache {
-        match &cache {
-            ConfigCache::Azure(cache) => {
-                let client = azure_blob_client(
-                    &cache.storage_account,
-                    &cache.storage_container,
-                    token.clone(),
-                    &format!("{name1}/{hash}/{name2}"),
-                )?;
-
-                if let Ok(result) = client.download(None).await {
-                    // N.B: Get the blob's data and stream it out directly instead of generating a SAS URL and returning a 302.
-                    //
-                    // This is important because this application may be placed behind a reverse proxy that supports auth,
-                    // and returning an SAS URL subverts the authority of the reverse proxy (e.g. reverse proxy may want
-                    // to log requests or set a time limit, but an SAS URL will allow users to bypass that).
-                    let r = Response::builder();
-                    let r = if let Some(content_length) = &result.properties.content_length {
-                        r.header(header::CONTENT_LENGTH, content_length.to_string())
-                    } else {
-                        r
-                    };
-
-                    return Ok(r
-                        .header(UPSTREAM_SOURCE, "cache")
-                        .header(header::CONTENT_TYPE, "application/octet-stream")
-                        .status(StatusCode::OK)
-                        .body(Body::from_stream(result.body))
-                        .context("failed to build response body")?);
-                }
-            }
-            ConfigCache::Fs(cache) => {
-                let path = cache.path.join(format!("{name1}/{hash}/{name2}"));
-                if let Ok(f) = tokio::fs::File::open(path.clone()).await {
-                    let meta = f.metadata().await.context("failed to get file metadata")?;
-                    let body = ReaderStream::new(f);
-
-                    return Ok(Response::builder()
-                        .header(UPSTREAM_SOURCE, "cache")
-                        .header(header::CONTENT_TYPE, "application/octet-stream")
-                        .header(header::CONTENT_LENGTH, meta.len().to_string())
-                        .status(StatusCode::OK)
-                        .body(Body::from_stream(body))
-                        .context("failed to build response body")?);
-                }
+        for &format in config.cache_formats() {
+            let key = format.client_key(&name1, &hash, &name2);
+            if let Some(response) = cache_lookup(cache, &token, &key, format).await? {
+                return Ok(response);
             }
         }
     }
 
-    let mut last_send_error = None;
+    let mut last_send_error: Option<anyhow::Error> = None;
     for server in &config.servers {
         let url = server
             .url
@@ -299,89 +536,129 @@ async fn symbol(
         // N.B: Normally we'd probably want to use a HEAD request here to determine what the server supports.
         // But Azure doesn't support HEAD requests.
 
-        // Dispatch a reqwest request to upstream, and serve the response.
-        // https://github.com/tokio-rs/axum/blob/680cdcba7cfa0b4fb37aba0c129ab6e4379bae3b/examples/reqwest-response/src/main.rs#L53-L68
-        let req_builder = client.get(url.clone());
-
         // If there is a scope attached to this server, attempt to authenticate.
-        let req_builder = if let Some(auth) = &server.auth {
-            req_builder.bearer_auth(
+        let bearer = match &server.auth {
+            Some(auth) => Some(
                 token
                     .get_token(&[auth.scope.as_str()], None)
                     .await
                     .context("failed to get token")?
                     .token
-                    .secret(),
-            )
-        } else {
-            req_builder
+                    .secret()
+                    .to_string(),
+            ),
+            None => None,
         };
 
-        // If a PDB filter is enabled, attempt to determine whether the PDB passes the filter.
-        if config.pdb_filter != PdbFilter::Any {
-            let t = Instant::now();
-
-            // Read the PDB from the upstream server using random I/O (via HTTP range requests)
-            let reader = req_builder
-                .try_clone()
-                .context("failed to clone request for PDB validation")?
-                .io();
-
-            let uri = url.clone();
-            let r = tokio::task::spawn_blocking(move || {
-                let pdb = Pdb::open_from_random_file(reader).context("failed to open PDB")?;
-                let flags = pdb_flags(&pdb).context("failed to determine PDB flags")?;
-
-                trace!("{}: {:?} ({}ms)", &uri, flags, t.elapsed().as_millis());
-                Ok::<_, Error>(pdb_filter::filter_matches(flags, config.pdb_filter))
-            })
-            .await
-            .context("PDB validation task panicked")?;
-
-            match r {
-                Ok(true) => (),
-                Err(e) => {
-                    warn!("failed to apply PDB filter to {url}: {e}");
-                    continue;
-                }
-                Ok(false) => {
-                    // TODO: Set a flag, and if all upstream sources are filtered then return it in the response.
-                    trace!(
-                        "upstream PDB from {} failed filter, trying next server ({}ms)",
-                        url,
-                        t.elapsed().as_millis(),
-                    );
-                    continue;
-                }
-            }
-        }
-
-        let req = match req_builder.send().await {
-            Ok(r) => r,
+        let resolved = match resolve(&client, url.clone(), bearer.as_deref(), &config).await {
+            Ok(resolved) => resolved,
             Err(e) => {
-                tracing::warn!("request to {} failed after retries: {:#}", url, e);
+                warn!("request to {} failed after retries: {:#}", url, e);
                 last_send_error = Some(e);
                 continue;
             }
         };
 
         // Check to see if the server returned a successful status code. If it didn't, continue on to the next server.
-        trace!("{}: {}", url, req.status());
-        if !req.status().is_success() {
+        trace!("{}: {}", resolved.url, resolved.response.status());
+        if !resolved.response.status().is_success() {
             continue;
         }
 
+        // Prefer the format advertised during redirection, then whatever the final response
+        // reports, and assume an ordinary PDB when the server tells us nothing.
+        let mut format = resolved
+            .format
+            .or_else(|| SymbolFormat::from_headers(resolved.response.headers()));
+
+        let mut response = resolved.response;
+
+        // If a PDB filter is enabled, attempt to determine whether the PDB passes the filter.
+        if config.pdb_filter != PdbFilter::Any {
+            let t = Instant::now();
+
+            // The filter reads the symbol with random I/O (via HTTP range requests) against the
+            // already-resolved URL, so abandon the response we are holding and re-fetch on success.
+            drop(response);
+
+            let credential = resolved
+                .authenticated
+                .then_some(bearer.as_deref())
+                .flatten();
+            let reader = build_upstream_request(&client, &resolved.url, credential, &config).io();
+
+            let uri = resolved.url.clone();
+            let pdb_filter = config.pdb_filter;
+            let r = tokio::task::spawn_blocking(move || {
+                let pdb = Pdb::open_from_random_file(reader).context("failed to open PDB")?;
+                let flags = pdb_flags(&pdb).context("failed to determine PDB flags")?;
+
+                // The container tells us definitively which format the server actually served.
+                let format = match pdb.container() {
+                    Container::Msfz(_) => SymbolFormat::Pdz,
+                    Container::Msf(_) => SymbolFormat::Pdb,
+                };
+
+                trace!("{}: {:?} ({}ms)", &uri, flags, t.elapsed().as_millis());
+                Ok::<_, Error>((pdb_filter::filter_matches(flags, pdb_filter), format))
+            })
+            .await
+            .context("PDB validation task panicked")?;
+
+            match r {
+                Ok((true, detected)) => format = Some(detected),
+                Err(e) => {
+                    warn!("failed to apply PDB filter to {url}: {e}");
+                    continue;
+                }
+                Ok((false, _)) => {
+                    // TODO: Set a flag, and if all upstream sources are filtered then return it in the response.
+                    trace!(
+                        "upstream PDB from {} failed filter, trying next server ({}ms)",
+                        resolved.url,
+                        t.elapsed().as_millis(),
+                    );
+                    continue;
+                }
+            }
+
+            response = match build_upstream_request(&client, &resolved.url, credential, &config)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("request to {} failed after retries: {:#}", resolved.url, e);
+                    last_send_error = Some(anyhow::Error::new(e));
+                    continue;
+                }
+            };
+
+            if !response.status().is_success() {
+                continue;
+            }
+        }
+
+        let format = format.unwrap_or(SymbolFormat::Pdb);
+
         // Forward out the full response from the upstream server, including headers and status code.
-        let mut response_builder = Response::builder().status(req.status());
+        let mut response_builder = Response::builder().status(response.status());
 
         if let Some(headers) = response_builder.headers_mut() {
-            *headers = req.headers().clone();
+            *headers = response.headers().clone();
 
             // Insert an additional header describing where this symbol originated from.
             headers.insert(UPSTREAM_SOURCE, HeaderValue::from_static("server"));
             headers.insert(
                 UPSTREAM_SERVER,
                 HeaderValue::from_str(server.url.as_str()).unwrap(),
+            );
+
+            // The redirect target is blob storage, which does not carry the symbol server's
+            // format negotiation, so restate it on the way out.
+            headers.insert(
+                SYMBOL_FORMAT_HEADER,
+                HeaderValue::from_static(format.symbol_format_header()),
             );
         }
 
@@ -392,11 +669,14 @@ async fn symbol(
         //
         // If disabled, we can simply direct the response stream back out to the requester directly.
         let stream: Pin<Box<dyn Stream<Item = _> + Send>> = if let Some(cache) = &config.cache {
-            let mut stream = req.bytes_stream();
+            let mut stream = response.bytes_stream();
             let (tx, rx) = tokio::sync::mpsc::channel(32);
 
             // Clone the cache into the task below.
             let cache = cache.clone();
+
+            // PDZ and PDB are distinct representations, so each is mirrored under its own key.
+            let key = format.client_key(&name1, &hash, &name2);
 
             tokio::spawn(async move {
                 match cache {
@@ -407,7 +687,7 @@ async fn symbol(
                             &cache.storage_account,
                             &cache.storage_container,
                             token.clone(),
-                            &format!("{name1}/{hash}/{name2}"),
+                            &key,
                         ) {
                             Ok(client) => Some(client.block_blob_client()),
                             Err(e) => {
@@ -506,7 +786,7 @@ async fn symbol(
                         Ok::<(), anyhow::Error>(())
                     }
                     ConfigCache::Fs(cache) => {
-                        let path = cache.path.join(format!("{name1}/{hash}/{name2}"));
+                        let path = cache.path.join(&key);
 
                         let mut f = {
                             let _ = tokio::fs::create_dir_all(path.parent().unwrap()).await;
@@ -540,7 +820,7 @@ async fn symbol(
 
             Box::pin(ReceiverStream::new(rx))
         } else {
-            Box::pin(req.bytes_stream())
+            Box::pin(response.bytes_stream())
         };
 
         // Stream out the response from the upstream server as we receive it.
@@ -708,10 +988,16 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to bind address")?;
 
     // Build the HTTP client with retry middleware for transient failures.
+    // The internal symbol server returns 302s for found symbols, but we need to get the `x-ms-symbol-format` header from the 302 response, so we disable automatic redirect following.
     let retry_policy = ExponentialBackoff::builder().build_with_max_retries(config.max_retries);
-    let client = reqwest_middleware::ClientBuilder::new(reqwest::Client::new())
-        .with(RetryTransientMiddleware::new_with_policy(retry_policy))
-        .build();
+    let client = reqwest_middleware::ClientBuilder::new(
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .context("failed to build HTTP client")?,
+    )
+    .with(RetryTransientMiddleware::new_with_policy(retry_policy))
+    .build();
 
     // Set up the `axum` application with a single endpoint to handle symbol server requests.
     let app = Router::new()
@@ -730,4 +1016,84 @@ async fn main() -> anyhow::Result<()> {
     axum::serve(listener, app.into_make_service())
         .await
         .context("failed to start server")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pdz_client_key_uses_the_msfz0_subdirectory() {
+        assert_eq!(
+            SymbolFormat::Pdz.client_key("ntdll.pdb", "ABC1", "ntdll.pdb"),
+            "ntdll.pdb/ABC1/msfz0/ntdll.pdb"
+        );
+        assert_eq!(
+            SymbolFormat::Pdb.client_key("ntdll.pdb", "ABC1", "ntdll.pdb"),
+            "ntdll.pdb/ABC1/ntdll.pdb"
+        );
+    }
+
+    #[test]
+    fn pdz_and_pdb_client_keys_never_collide() {
+        let pdb = SymbolFormat::Pdb.client_key("ntdll.pdb", "ABC1", "ntdll.pdb");
+        let pdz = SymbolFormat::Pdz.client_key("ntdll.pdb", "ABC1", "ntdll.pdb");
+
+        assert_ne!(pdb, pdz);
+        assert!(pdz.starts_with("ntdll.pdb/ABC1/"));
+    }
+
+    #[test]
+    fn format_comes_only_from_the_symbol_format_header() {
+        let headers = |pairs: &[(&str, &str)]| {
+            let mut map = reqwest::header::HeaderMap::new();
+            for (k, v) in pairs {
+                map.insert(
+                    reqwest::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                    HeaderValue::from_str(v).unwrap(),
+                );
+            }
+            map
+        };
+
+        // The symbol server states the format explicitly.
+        assert_eq!(
+            SymbolFormat::from_headers(&headers(&[(SYMBOL_FORMAT_HEADER, "application/msfz0")])),
+            Some(SymbolFormat::Pdz)
+        );
+
+        // An empty value means a plain PDB.
+        assert_eq!(
+            SymbolFormat::from_headers(&headers(&[(SYMBOL_FORMAT_HEADER, "")])),
+            None
+        );
+
+        // `Content-Type` is blob storage's, not the symbol server's, so it is never consulted.
+        assert_eq!(
+            SymbolFormat::from_headers(&headers(&[("content-type", "application/msfz0")])),
+            None
+        );
+        assert_eq!(
+            SymbolFormat::from_headers(&headers(&[("content-type", "application/octet-stream")])),
+            None
+        );
+    }
+
+    #[test]
+    fn msfz_content_type_is_recognised() {
+        let parse = |v: &str| SymbolFormat::from_media_type(&HeaderValue::from_str(v).unwrap());
+
+        assert_eq!(parse("application/msfz0"), Some(SymbolFormat::Pdz));
+        assert_eq!(parse("Application/MSFZ0; q=1"), Some(SymbolFormat::Pdz));
+        assert_eq!(parse("application/octet-stream"), None);
+    }
+
+    #[test]
+    fn path_segments_cannot_escape_the_cache() {
+        assert!(valid_segment("ntdll.pdb"));
+        assert!(!valid_segment(".."));
+        assert!(!valid_segment(""));
+        assert!(!valid_segment("a/b"));
+        assert!(!valid_segment("a\\b"));
+    }
 }
